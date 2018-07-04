@@ -11,14 +11,8 @@ from pysc2.env import remote_sc2_env
 
 # !!! LOAD YOUR BOT HERE !!!
 from simple_agent import SimpleAgent
-
 from zerg_agent_step7 import ZergAgent
-
-AGENT = SimpleAgent()
-AGENT2 = ZergAgent()
-
 from zerg_macro import ZergMacroAgent
-
 
 RACE = sc2_env.Race.zerg
 
@@ -31,62 +25,36 @@ AGENT_INTERFACE_FORMAT = sc2_env.parse_agent_interface_format(
     action_space="FEATURES", #FEATURES or RGB
     use_feature_units=True)
 
-# Flags
-FLAGS = flags.FLAGS
-flags.DEFINE_integer("GamePort", None, "GamePort")
-flags.DEFINE_integer("StartPort", None, "StartPort")
-flags.DEFINE_string("LadderServer", "127.0.0.1", "LadderServer")
-flags.DEFINE_string("OpponentId", None, "OpponentId")
-
-# Run ladder game
-def run_ladder_game():
-    # Join ladder game
-    with remote_sc2_env.RemoteSC2Env(
-        host=FLAGS.LadderServer,
-		      host_port=FLAGS.GamePort,
-        lan_port=FLAGS.StartPort + 2, #s2client-api and pysc2 have different opinions what "startport" means,
-        race=RACE,
-        step_mul=STEP_MUL,
-        agent_interface_format=AGENT_INTERFACE_FORMAT,
-        visualize=True) as env:
-        agents = [AGENT]
-        logging.info("Connected, starting run_loop.")
-        try:
-            run_loop.run_loop(agents, env)
-        except remote_sc2_env.RestartException:
-            pass
-    logging.info("Done.")
-
 # Start game
 def main(argv):
-    # if "--LadderServer" in sys.argv:
-    #     # Ladder game started by LadderManager
-    #     logging.info("Starting ladder game...")
-    #     run_ladder_game()
-    # else:
-        # Local game
     logging.info("Starting local game...")
+
+    maxSecond = 300
+    max_steps = 16/STEP_MUL * 1.4 * maxSecond #adjusting for 1.4 for "faster" game speed setting
+    max_episodes = 1
 
     players = []
     agents = []
 
     players.append(sc2_env.Agent(RACE))
-    agents.append(ZergMacroAgent())
+    agents.append(ZergMacroAgent(max_steps))
     
-    #players.append(sc2_env.Agent(RACE))
-    #agents.append(SimpleAgent)
     players.append(sc2_env.Bot(sc2_env.Race.random, sc2_env.Difficulty.very_easy))
 
     with sc2_env.SC2Env(
         map_name= "AbyssalReef", #"Simple64",
         players=players,
-        visualize=True,
+        visualize=False,
         step_mul=STEP_MUL,
         agent_interface_format=AGENT_INTERFACE_FORMAT) as env:
 
-        max_steps = 0 #no max steps
-        max_episodes = 1
-        run_loop.run_loop(agents, env, max_steps, max_episodes)
+        # hack to override maxEpisodes as it doesn't seem to work
+        # TODO: there is probably an unreported exception in the try catch at: https://github.com/deepmind/pysc2/blob/7b7afd7eeae985e6498855ac368c865ed9d527fb/pysc2/env/run_loop.py 
+        total_episodes = 0
+        while not max_episodes or total_episodes < max_episodes:
+            total_episodes += 1
+            run_loop.run_loop(agents, env, max_steps, 1)
+            
 
 
 if __name__ == '__main__':

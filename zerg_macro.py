@@ -1,6 +1,3 @@
-## Inspired by  StevenBrown 
-"""A base agent to write custom scripted agents."""
-
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -8,74 +5,111 @@ from __future__ import print_function
 from pysc2.agents import base_agent
 from pysc2.lib import actions, features, units
 
-from enum import IntEnum, auto
+from enum import IntEnum, auto, Enum
 import random
 
-class ContextEnum(IntEnum):
-  NumBases = auto()
+import heapq
+import unit_build_time
+import data_IO
 
-  FeatureDimension = auto()
+EnableDebug = False
 
-class MacroGlobalFeatureSet(IntEnum):
-  MineralCount = auto()
-  GasCount = auto()
-  Population = auto()
-  PopulationCap = auto() # essentially same infomation as overlord count
-  FreeSupply = auto() # populationCap - population
-  WorkerCount = auto()
-  ArmyCount = auto()
-  WorkerIdle = auto()
-  LarvaCount = auto()
+class AutoNumber(Enum):
+  def __new__(cls):
+    value = len(cls.__members__)  # note no + 1
+    obj = object.__new__(cls)
+    obj._value_ = value
+    return obj
 
-  BaseCount = auto()
-  ExtractorCount = auto()
- 
-  WorkerOnMineral = auto()
-  WorkerOnGas = auto()
-  WorkerBuilding = auto()
-
-  QueenCount = auto()
+  def __int__(self):
+    return self.value
 
 
-  FeatureDimension = auto()
 
-class MacroPerBaseFeatureSet(IntEnum):
-  IsMain = auto()
-  MineralFieldCount = auto()
-  WorkerOnMineral = auto()
+class MacroGlobalFeatureSet(AutoNumber):
+  MineralCount = ()
+  GasCount = ()
+  Population = ()
+  PopulationCap = () # essentially same infomation as overlord count
+  FreeSupply = () # populationCap - population
+  WorkerCount = ()
+  ArmyCount = ()
+  WorkerIdle = ()
+  LarvaCount = ()
 
-  GasCount = auto()
-  WorkerOnGas = auto()
+  WorkerBuilding = ()
+  PopulationBuilding = ()
 
-  WorkerBuilding = auto()
+  #QueenCount = ()
+  #BaseCount = ()
 
-  QueenCount = auto()
-  IsInjected = auto()
+  #ExtractorCount = ()
+  #WorkerOnMineral = ()
+  #WorkerOnGas = ()
 
-  FeatureDimension = auto()
+  FeatureDimension = ()
 
+class MacroPerBaseFeatureSet(AutoNumber):
+  IsMain = ()
+  MineralFieldCount = ()
+  WorkerOnMineral = ()
 
-# Functions
-_NOOP = actions.FUNCTIONS.no_op.id
+  GasCount = ()
+  WorkerOnGas = ()
+
+  WorkerBuilding = ()
+
+  QueenCount = ()
+  IsInjected = ()
+
+  FeatureDimension = ()
+
+class MacroRewardRecord(AutoNumber):
+  MineralCount = ()
+  FeatureDimension = ()
+
+class ActionRecord(AutoNumber):
+  # record all actions
+  # note it does not record all effective action, which is recorded separately
+  BuildWorker = ()
+  BuildOverloard = ()
+  FeatureDimension = ()
+
+UnitBuildingMap = {
+  units.Zerg.Drone : MacroGlobalFeatureSet.WorkerBuilding,
+  units.Zerg.Overlord : MacroGlobalFeatureSet.PopulationBuilding
+}
 
 class ZergMacroAgent(base_agent.BaseAgent):
-  def __init__(self):
+  def __init__(self, MaxStep):
     super(ZergMacroAgent, self).__init__()
+    self.pauseDebug = "0"
 
-    #self.attack_coordinates = None
-    self.unitSpace = [units.Zerg.Hatchery, units.Zerg.Drone, units.Zerg.Overlord, units.Zerg.SpawningPool, units.Zerg.Queen]
-
-    # TODO: understand what is purified mineral
-    self.neutralUnitSpace = [units.Neutral.MineralField, units.Neutral.MineralField750, units.Neutral.RichMineralField, units.Neutral.RichMineralField750]
-
+    self.maxStep = MaxStep
+    self.reset()
+  
+  def reset(self):
+    super(ZergMacroAgent, self).reset()
     self.mineral = 0
     self.reward = 0
 
     self.startX = 0
     self.startY = 0
 
+    self.internalStepCounter = 0
+
     self.globalActionQueue = []
-  
+    self.buildHeapq = []
+
+    self.globalFeatureRecord = []
+    self.globalRewardRecord = []
+    self.ActionRecord = []
+    self.EffectiveRecord = []
+
+    self.performedLastOperation = False
+
+    return
+
   def can_do(self, obs, action):
     return action in obs.observation.available_actions
 
@@ -140,11 +174,10 @@ class ZergMacroAgent(base_agent.BaseAgent):
       action2 = actionUnit2[i]
 
       if(action1[1] != action2[1]):
-        # TODO: shall we check not just function id?
+        # Qustion: shall we check not just function id?
         return False
 
     return True
-
 
   def dedupConsecutiveSameOrder(self):
     if(len(self.globalActionQueue)>2):
@@ -165,7 +198,7 @@ class ZergMacroAgent(base_agent.BaseAgent):
       actionUnit = self.globalActionQueue.pop(0)
 
       if(len(actionUnit) == 0):
-        return actions.FUNCTIONS.no_op()
+        return actions.FUNCTIONS.no_op(), actions.FUNCTIONS.no_op.id
       else:
         firstActionPair = actionUnit.pop(0)
         actionFunc = firstActionPair[0]
@@ -175,49 +208,159 @@ class ZergMacroAgent(base_agent.BaseAgent):
           if(len(actionUnit) > 0):
             self.globalActionQueue = [actionUnit] + self.globalActionQueue
 
-          return actionFunc
+          # if it is a build action, register it in build queue
+          if actionFuncId in unit_build_time.UnitBuildActionSet:
+            unitId = unit_build_time.UnitBuildAction[actionFuncId]
+            unitBuildTimeStep = unit_build_time.UnitBuildTime[unitId]
+            expectFinishTime = self.internalStepCounter + unitBuildTimeStep
+            heapq.heappush(self.buildHeapq, (expectFinishTime, unitId))
 
-    return actions.FUNCTIONS.no_op()
+          return actionFunc, actionFuncId
 
+    return actions.FUNCTIONS.no_op(), actions.FUNCTIONS.no_op.id
 
+  # TODO: port in online learning
+  def trainModel(self, buffer):
+    return True
+
+  def initStep(self, obs):
+    player_y, player_x = (obs.observation.feature_minimap.player_relative ==
+                            features.PlayerRelative.SELF).nonzero()
+    self.startX = player_x.mean()
+    self.startY = player_y.mean()
+
+    self.reset()
+    return
+
+  def lastStep(self,obs):
+    print('Final Mineral:', str(self.mineral))
+    print('Final Step:', str(self.internalStepCounter))
+    
+    gf_path, _ = data_IO.genLatestFile(".//data", "globalFeatures")
+    data_IO.export2DArray(self.globalFeatureRecord, gf_path)
+
+    rw_path, _ = data_IO.genLatestFile(".//data", "macroRewards")
+    data_IO.export2DArray(self.globalRewardRecord, rw_path)
+
+    action_path, _ = data_IO.genLatestFile(".//data", "actions")
+    data_IO.export2DArray(self.ActionRecord, action_path)
+
+    effectiveAction_path, _ = data_IO.genLatestFile(".//data", "effectiveAction")
+    data_IO.export2DArray(self.EffectiveRecord, effectiveAction_path)
+
+    self.performedLastOperation = True
+    
+    return
 
   def step(self, obs):
     super(ZergMacroAgent, self).step(obs)
 
-    # if obs.first():
-    #   player_y, player_x = (obs.observation.feature_minimap.player_relative ==
-    #                         features.PlayerRelative.SELF).nonzero()
-    #   self.startX = player_x.mean()
-    #   self.startY = player_y.mean()
+    if EnableDebug and (self.pauseDebug == "1" or self.internalStepCounter % 100 == 0):
+      self.pauseDebug = input("pause prompt \n")
+      print('current Step:', str(self.internalStepCounter))
+      print('Units In Queue', str(len(self.buildHeapq)))
 
+    if obs.first():
+      self.initStep(obs)
+
+    self.internalStepCounter += 1
+    self.expireBuiltUnitFromQueue()
+    
     globalFeatures = self.globalMacroFeatureExtractor(obs)
+    rewards = self.MacroRewardExtractor(obs)
+    
+    self.globalFeatureRecord.append(globalFeatures)
+    self.globalRewardRecord.append(rewards)
+    
+    # ------- Detect last iteration -----------
+    if obs.last() or (self.internalStepCounter >= self.maxStep - 4 and self.maxStep > 0):
+      # capture 1 second before the end
+      if not self.performedLastOperation:
+        self.lastStep(obs)
 
-    if(globalFeatures[MacroGlobalFeatureSet.FreeSupply] <= 1):
+    # ------------------------------------------
+
+    # ------- Core sub-Models -----------------------------
+    actionVector = [0] * int(ActionRecord.FeatureDimension)
+
+    if(globalFeatures[int(MacroGlobalFeatureSet.FreeSupply)] <= 1): 
       self.buildOverlordAction(obs)
+      actionVector[int(ActionRecord.BuildOverloard)] = 1
     else:
       self.buildDroneAction(obs)
+      actionVector[int(ActionRecord.BuildWorker)] = 1
 
+    self.ActionRecord.append(actionVector)
+    # -----------------------------------------------------
+    # heuristic filters
     self.dedupConsecutiveSameOrder()
-    return self.executeDequeue(obs)
-    #return actions.FunctionCall(_NOOP, [])
 
-  def globalMacroFeatureExtractor(self, obs):
-    f = [0]*MacroGlobalFeatureSet.FeatureDimension
+    # ------- Core final ranker ----------------------------
 
-    f[MacroGlobalFeatureSet.MineralCount] = obs.observation.player.minerals
-    f[MacroGlobalFeatureSet.GasCount] = obs.observation.player.vespene
 
-    f[MacroGlobalFeatureSet.Population] = obs.observation.player.food_used
-    f[MacroGlobalFeatureSet.PopulationCap] = obs.observation.player.food_cap
-    f[MacroGlobalFeatureSet.FreeSupply] = (obs.observation.player.food_cap - obs.observation.player.food_used)
+    actionFunc, actionFuncId = self.executeDequeue(obs) 
+    self.EffectiveRecord.append(actionFuncId)
+    return actionFunc
 
-    f[MacroGlobalFeatureSet.WorkerCount] = obs.observation.player.food_workers
-    f[MacroGlobalFeatureSet.WorkerIdle] = obs.observation.player.idle_worker_count
-    f[MacroGlobalFeatureSet.ArmyCount] = obs.observation.player.army_count
 
-    f[MacroGlobalFeatureSet.LarvaCount] = obs.observation.player.larva_count
+  def MacroRewardExtractor(self,obs):
+    f = [0]*int(MacroRewardRecord.FeatureDimension)
+    f[int(MacroRewardRecord.MineralCount)] = obs.observation.player.minerals
 
-    f[MacroGlobalFeatureSet.BaseCount] = len(self.get_units_by_type(obs, units.Zerg.Hatchery))
-    
     return f
 
+  def globalMacroFeatureExtractor(self, obs):
+    f = [0]*int(MacroGlobalFeatureSet.FeatureDimension)
+
+    self.mineral = obs.observation.player.minerals
+
+    f[int(MacroGlobalFeatureSet.MineralCount)] = obs.observation.player.minerals
+    f[int(MacroGlobalFeatureSet.GasCount)] = obs.observation.player.vespene
+
+    f[int(MacroGlobalFeatureSet.Population)] = obs.observation.player.food_used
+    f[int(MacroGlobalFeatureSet.PopulationCap)] = obs.observation.player.food_cap
+    f[int(MacroGlobalFeatureSet.FreeSupply)] = (obs.observation.player.food_cap - obs.observation.player.food_used)
+
+    f[int(MacroGlobalFeatureSet.WorkerCount)] = obs.observation.player.food_workers
+    f[int(MacroGlobalFeatureSet.WorkerIdle)] = obs.observation.player.idle_worker_count
+    f[int(MacroGlobalFeatureSet.ArmyCount)] = obs.observation.player.army_count
+
+    f[int(MacroGlobalFeatureSet.LarvaCount)] = obs.observation.player.larva_count
+    #f[int(MacroGlobalFeatureSet.BaseCount)] = len(self.get_units_by_type(obs, units.Zerg.Hatchery))
+
+    self.extractUnitInBuild(f)
+    return f
+
+  def extractUnitInBuild(self, f):
+    if len(self.buildHeapq) == 0:
+      return
+
+    for i in range(len(self.buildHeapq)):
+      unitInBuildId = self.buildHeapq[i][1]
+
+      # simulated switch statement
+      # TODO: more optimized lookup out of stack
+      featureId = int(UnitBuildingMap.get(unitInBuildId, -1))
+
+      if featureId != -1:
+        f[featureId] += 1
+
+    return
+
+  def expireBuiltUnitFromQueue(self):
+    if len(self.buildHeapq) == 0:
+      return
+
+    finishTimeStep, unitId = heapq.heappop(self.buildHeapq)
+
+    while finishTimeStep <= self.internalStepCounter:
+      if(len(self.buildHeapq) == 0):
+        return
+      finishTimeStep, unitId = heapq.heappop(self.buildHeapq)
+
+    if finishTimeStep > self.internalStepCounter:
+      heapq.heappush(self.buildHeapq, (finishTimeStep, unitId))
+
+    return
+
+  
